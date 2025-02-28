@@ -1,5 +1,8 @@
 # Source Code for "Scalability of the second-order reliability method for stochastic differential equations with multiplicative noise"
 
+> T. Schorlepp and T. Grafke, "Scalability of the second-order reliability method for stochastic differential equations with multiplicative noise", [arXiv:2502.20114](https://arxiv.org/abs/2502.20114) [stat.CO], February 2025.
+
+
 ### Problem formulation
 
 The code in this repository can be used to determine the tail probability
