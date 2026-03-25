@@ -36,29 +36,41 @@ init_phi = jnp.array([x0, y0])
 
 targetObs = 0.5
 
-print('################################################')
-print('################## Parameters ##################')
-print('T =', T)
-print('nt =', nt)
-print('z =', targetObs)
-print('################################################')
+print('Running Instanton computation for DN shell model')
+print(f'Parameters: T={T}, dt={dt}, sigma^2={sigma ** 2.}, dim={dim}')
 
 
 plots = True # option for producing plots of instanton and operator spectra
 projectEtaPerp = True # set to false for calculating MGF prefactor and explicit transformation to tail probability; only works for convex rate function
 ######################################################################
-# model functions
+# define model functions
 
-def jgetB(x):
-    return jnp.array([-beta * x[0] * x[1] + alpha * x[0] + delta,
-                      +beta * x[0] * x[1] - gamma * x[1] + delta])
+getIF = lambda u, dt: u * jnp.exp(-nu * k[:, None]**2 * dt)  # integrating factor for linear terms in b times x
 
-def jgetSigma(x,dx):
-    return jnp.array([jnp.sqrt(beta * x[0] * x[1] + alpha * x[0] + delta) * dx[0],
-                      jnp.sqrt(beta * x[0] * x[1] + gamma * x[1] + delta) * dx[1]])
+getEnergy = lambda u: 0.5 * u**2
+getEnergyDissipation = lambda u : jnp.sum(nu * k[:,None]**2 * u**2, axis = 0)
 
-def jgetF(x):
-    return x[0]
+def jgetG(u):
+    """
+    :param u: (dim, nPaths)
+    :return: (dim, nPaths)
+    """
+    Gu = jnp.zeros_like(u)
+
+    Gu = Gu.at[1:].add(c1 * k[1:, None] * u[:-1] * u[:-1])
+    Gu = Gu.at[:-1].add(-c1 * k[1:, None] * u[:-1] * u[1:])
+    Gu = Gu.at[1:].add(c2 * k[1:, None] * u[:-1] * u[1:])
+    Gu = Gu.at[:-1].add(-c2 * k[1:, None] * u[1:] * u[1:])
+
+    return Gu
+
+def jgetChi(dW):
+    """Forcing correlation matrix multiplied by random motion
+        :param dW: (dim, nPaths) random Brownian motion
+        :return: (dim, nPaths) forcing applied to system
+        """
+    return chi_sqrt[:, None] * dW
+
 
 ######################################################################
 # quadrature rule for time integrals
@@ -66,20 +78,13 @@ def jgetF(x):
 def jgetTimeIntegral(a, b):
     ret = jnp.sum(a * b, axis = 1) * dt
     return jnp.sum(ret[:-1])
-    
-######################################################################
-# for invertible diffusion matrix; use this to get theta easily from theta_z = a^{-1} sigma eta_z
-
-def jgetAInverse(x, dx):
-    sigma = jgetSigma(x, jnp.eye(dim))
-    return jnp.linalg.inv(sigma @ sigma.T) @ dx
 
 ######################################################################
 # JAX implementation of noise to observable map that can be automatically differentiated
 
 def integrate_forward_jax(etaa):
     def scan_fun(phi, etaaa):
-        ret_phi = phi + dt * (jgetB(phi) + jgetSigma(phi, etaaa))
+        ret_phi = phi + dt * (jgetG(phi) + jgetSigma(phi, etaaa))
         return ret_phi, ret_phi
     phiT, phi = jax.lax.scan(scan_fun, copy.copy(init_phi), etaa[:-1])
     phi = jnp.concatenate([init_phi[None, :], phi], axis = 0)
