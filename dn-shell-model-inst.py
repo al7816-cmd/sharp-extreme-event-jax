@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.sparse.linalg import LinearOperator, eigs
 from scipy.stats import norm
+
 import jax
 import jax.numpy as jnp
 import scipy.optimize as spo
@@ -16,26 +17,22 @@ jax.config.update("jax_traceback_filtering", "off")
 ######################################################################
 # set up parameters for model
 
-T = 1
-dt = 1e-4
+T = 300
+dt = 1e-3
 nt = int(T / dt)
 t = jnp.linspace(0., T, nt + 1)
 
 # DN shell model parameters
 dim = 17    # number of discretized concentric shells n = 0 ... dim - 1
-c1 = 1.0    # constant parameter for getG
+c1 = 0.001    # constant parameter for getG
 c2 = 0.0    # constant parameter for getG
 nu = 1e-2   # viscosity
 k = 2 ** jnp.linspace(0, dim-1, dim) # wavenumbers
 sigma = 1.  # noise strength for direct sampling
 chi_sqrt = sigma * k**(-3.)  # forcing cov sqrt
 
-# initial condition: start at fixed point
-x0 = 1. / (5. * jnp.sqrt(2.))
-y0 = x0 + 0.2
 init_u = jnp.zeros(dim)
-
-targetObs = 0.5
+targetObs = 82.34
 
 print('Running Instanton computation for DN shell model')
 print(f'Parameters: T={T}, dt={dt}, sigma^2={sigma ** 2.}, dim={dim}')
@@ -120,6 +117,19 @@ def integrate_forward_jax(etaa):
 def integrate_forward_obs_jax(etaa):
     return integrate_forward_jax(etaa)[1]
 
+
+def integrate_forward(etaa):
+    def scan_fun(u, eta_i):
+        u_next = jgetIF_single(u + dt * jgetG_single(u) + dt * jgetChi_single(eta_i), dt)
+        ener = jnp.sum(nu * k ** 2 * u_next ** 2)
+        return u_next, (u_next, ener)
+
+    uT, (u_all, ener_diss) = jax.lax.scan(scan_fun, init_u, etaa[:-1])
+    u_all = jnp.concatenate([init_u[None, :], u_all], axis=0)
+    ener_diss = jnp.concatenate([jnp.array([jnp.sum(nu * k ** 2 * init_u ** 2)]), ener_diss])
+    return u_all, jgetF(uT), ener_diss
+
+"""
 # jax numpy implementation of forward map that returns the full state space instanton trajectory for diagnostics
 def integrate_forward(etaa):
     u = jnp.zeros((nt + 1, dim))
@@ -128,7 +138,9 @@ def integrate_forward(etaa):
         u = u.at[i+1, :].set(
             jgetIF_single(u[i] + dt * jgetG_single(u[i]) + dt * jgetChi_single(etaa[i]), dt) # * jnp.exp(-nu * k**2 * dt)
         )
-    return u, jgetF(u[-1])
+    ener_diss = jnp.sum(nu * k**2 * u**2, axis=1)
+    return u, jgetF(u[-1]), ener_diss
+"""
 
 ######################################################################
 # numpy implementation for direct Monte Carlo simulations of the DN shell model
@@ -175,21 +187,30 @@ class Instanton():
             self.eta = np.random.randn(nt + 1, dim) / jnp.sqrt(dt) # initializes eta as a random white noise (Gaussian)
         else:
             self.eta = initialEta
-        
+
         def target_func(eta):
             etaa = jnp.asarray(np.reshape(eta, (nt + 1, dim)))
             obs = integrate_forward_obs_jax(etaa)
-            ret = 0.5 * jgetTimeIntegral(etaa, etaa) - lbda * (obs - targetObservable) + mu / 2. * (targetObservable - obs)**2
-            return ret
+            ret = 0.5 * jgetTimeIntegral(etaa, etaa) - lbda * (obs - targetObservable) + mu / 2. * (
+                        targetObservable - obs) ** 2
+            return ret  # keep as JAX array for grad tracing
 
-        target_func_grad = jax.jacrev(target_func)
-        res = spo.minimize(target_func, self.eta.flatten(), method = 'L-BFGS-B', jac = target_func_grad, options = {'ftol': 1e-8, 'gtol': 1e-8, 'disp': False})
+        target_func_grad_jax = jax.grad(target_func)
+
+        def target_func_grad(eta):
+            return np.array(target_func_grad_jax(eta))
+
+        def target_func_wrapper(eta):
+            return float(target_func(eta))
+
+        res = spo.minimize(target_func_wrapper, self.eta.flatten(), method='L-BFGS-B', jac=target_func_grad,
+                           options={'ftol': 1e-8, 'gtol': 1e-8, 'disp': False})
         print(res)
         res = res.x
 
         self.eta = copy.copy(jnp.reshape(res, (nt + 1, dim)))
         
-        u, obsValue = integrate_forward(self.eta)
+        u, obsValue, ener_diss = integrate_forward(self.eta)
         
         action = 0.5 * jgetTimeIntegral(self.eta, self.eta) # this is 1/2 * L^2 norm
         print('################################################')
@@ -198,23 +219,38 @@ class Instanton():
         print('mu =', mu)
         print('observable =', obsValue)
         print('Action =', action)
-        ret = obsValue, action, lbda, copy.copy(self.eta), u
+        ret = obsValue, action, lbda, copy.copy(self.eta), u, ener_diss
         dS = 0.5 * np.real(np.sum(self.eta**2., axis = 1) * dt)
         ret = ret + (dS,)
         return ret
         
-    def searchInstantonViaAugmented(self, targetObservable, muMin = np.log10(5.), muMax = np.log10(100.), nMu = 8, initLbda = 1.):
+    def searchInstantonViaAugmented(self, targetObservable, muMin = np.log10(5.), muMax = np.log10(100.), nMu = 8, initLbda = 1., initialEta = None):
         print("Find instanton for observable value", targetObservable, "via augmented Lagrangian method.")
         muList = np.logspace(muMin, muMax, nMu)
-        obsValue, action, lbda, eta, u, dS = self.optimize(initLbda, targetObservable = targetObservable, mu =  muList[0])
+        obsValue, action, lbda, eta, u, ener_diss, dS = self.optimize(initLbda, targetObservable = targetObservable, mu = muList[0], initialEta = initialEta)
         print("Mu = {}, lambda = {} yields observable = {} and action = {}".format(muList[0], lbda, obsValue, action))
         lbda = muList[0] * (targetObservable - obsValue) + initLbda
         for j in range(1, nMu):
-            obsValue, action, lbda, eta, u, dS = self.optimize(lbda, targetObservable = targetObservable, mu =  muList[j], initialEta = eta)
+            obsValue, action, lbda, eta, u, ener_diss, dS = self.optimize(lbda, targetObservable = targetObservable, mu =  muList[j], initialEta = eta)
             print("Mu = {}, lambda = {} yields observable = {} and action = {}".format(muList[j], lbda, obsValue, action))
             lbda = muList[j] * (targetObservable - obsValue) + lbda
-        return obsValue, action, lbda, eta, u, dS
+        return obsValue, action, lbda, eta, u, ener_diss, dS
 
+######################################################################
+# extracting u_n snapshots at each integer second
+
+def get_snapshots_per_second(u_trajectory):
+    """
+    Extract u_n at t = 1, 2, ..., T from the full trajectory.
+    :param u_trajectory: (nt+1, dim) array from integrate_forward
+    :return: (dim, int(T)) array where column j is u(:, t=j+1)
+    """
+    n_seconds = int(T)
+    snapshots = np.zeros((dim, n_seconds))
+    for s in range(n_seconds):
+        time_index = int((s + 1) / dt)  # index for t = s+1
+        snapshots[:, s] = np.array(u_trajectory[time_index, :])
+    return snapshots
 
 ######################################################################
 ######################################################################
@@ -222,66 +258,79 @@ class Instanton():
 
 if __name__ == '__main__':
 
+    if len(sys.argv) > 1:
+        targetObs = float(sys.argv[1])
+
     now = datetime.now()
     dt_string = now.strftime('%Y_%m_%d_%H_%M_%S')
-    data_dir = '/Users/rawdata/Downloads/data/inst/obs_{}_date_{}'.format(targetObs, dt_string)
+    data_dir = '/Users/rawdata/Downloads/data/inst/nu_{}_c1_{}_c2_{}_obs_{}_date_{}'.format(nu, c1, c2, targetObs, dt_string)
     if not os.path.isdir(data_dir):
         os.makedirs(data_dir)
     np.save(data_dir + '/obs.npy', targetObs)
 
-    # uncomment for output to log file
-    #sys.stdout = open('{}/output_.log'.format(data_dir), 'w', buffering = 1)
-
-    ############################################################
-    # Monte Carlo of SDE
-    eps = 0.01
-    u, t, u_T, velo_grad_T = getSamplePaths(nPaths=1000)
-
     ############################################################
     # instanton computation
+    print("Running Instanton Computation for DN Shell Model")
+
+    print("DN Shell Model Parameters: ")
+    print("viscosity: ", nu)
+    print("c1: ", c1)
+    print("c2: ", c2)
+    print("target observation: ", targetObs)
+
     start = time.time()
 
     instanton = Instanton()
-
-    obsValue, action, lbda, eta, u, dS = instanton.searchInstantonViaAugmented(targetObs)
+    t_np = np.array(t)
+    obsValue, action, lbda, eta, u, ener_diss, dS = instanton.searchInstantonViaAugmented(targetObs)
+    u_snapshots = get_snapshots_per_second(u) # to track the evolution of u over time for each shell
 
     np.save(data_dir + '/inst_obs.npy', obsValue)
     np.save(data_dir + '/inst_act.npy', action)
     np.save(data_dir + '/inst_lbda.npy', lbda)
     np.save(data_dir + '/inst_eta.npy', eta)
     np.save(data_dir + '/inst_u.npy', u)
+    np.save(data_dir + '/ener_diss.npy', ener_diss)
     np.save(data_dir + '/inst_ds.npy', dS)
-
-    print('Needed', time.time() - start, 'seconds for the instanton computation...')
+    np.save(data_dir + '/inst_u_per_second.npy', u_snapshots)
 
     if plots:
         plt.figure()
-        plt.plot(u[:,0], u[:,1])
-        plt.axvline(x = targetObs, color = 'black', linestyle = 'dashed')
-        plt.scatter([x0], [y0], color = 'orange')
-        plt.xlabel(r'$x$')
-        plt.ylabel(r'$y$')
-        plt.savefig(data_dir + '/inst.pdf', bbox_inches = 'tight')
+        for n in range(dim):
+            plt.plot(t_np, np.array(u[:, n]), label=f'shell {n}')
+        plt.xlabel(r'$t$')
+        plt.ylabel(r'$u_n(t)$')
+        plt.legend(fontsize=6, ncol=3)
+        plt.savefig(data_dir + '/inst_u.pdf', bbox_inches='tight')
         plt.close()
 
-    ############################################################
-    # load previously computed instanton
+        plt.figure()
+        plt.plot(t_np, np.array(ener_diss))
+        plt.xlabel(r'$t$')
+        plt.ylabel(r'$\epsilon = \nu \sum k_n^2 u_n^2$')
+        plt.savefig(data_dir + '/inst_ener_diss.pdf', bbox_inches='tight')
+        plt.close()
 
-    # data_dir = 'data/...'
-    # obsValue = np.load(data_dir + '/inst_obs.npy')
-    # action   = np.load(data_dir + '/inst_act.npy')
-    # lbda     = np.load(data_dir + '/inst_lbda.npy')
-    # eta      = np.load(data_dir + '/inst_eta.npy')
-    # u        = np.load(data_dir + '/inst_u.npy')
-    # dS       = np.load(data_dir + '/inst_ds.npy')
-    # instanton = Instanton()
-    
-    ############################################################
+        plt.figure()
+        plt.plot(np.arange(dim), np.array(jgetEnergy(u[-1])))
+        plt.xlabel(r'shell $n$')
+        plt.ylabel(r'$E_n = \frac{1}{2} u_n^2$')
+        plt.savefig(data_dir + '/inst_energy.pdf', bbox_inches='tight')
+        plt.close()
 
-    """
-    print('Tail prob prefactor:', prefProb)
-    np.save(data_dir + '/prefProb.npy', prefProb)
-    print('Noise strength:', eps)
-    print("Tail probability estimate:", np.sqrt(eps/(2. * np.pi)) * prefProb * np.exp(-action/eps))
-    """
-    
+        plt.figure()
+        n_seconds = int(T)
+        shells = np.arange(dim)
+        for s in range(n_seconds):
+            u_at_t = u_snapshots[:, s]
+            u_sq = np.array(u_at_t ** 2)
+            u_sq = np.where(u_sq > 0, u_sq, np.nan)  # avoid log(0)
+            plt.plot(shells, u_sq, label=f't = {s + 1}', marker='o')
+        plt.xlabel(r'shell $n$')
+        plt.ylabel(r'$\log(u_n^2)$')
+        plt.yscale('log')
+        plt.legend(fontsize=6, ncol=2)
+        plt.savefig(data_dir + '/inst_log_energy_spectrum.pdf', bbox_inches='tight')
+        plt.close()
+
+    print('Needed', time.time() - start, 'seconds for the instanton computation...')
