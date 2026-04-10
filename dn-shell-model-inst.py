@@ -74,6 +74,7 @@ def jgetChi(dW):
     return chi_sqrt[:, None] * dW
 
 # to be used in instanton computation
+@jax.jit
 def jgetG_single(u):
     """
     :param u: (dim,) single state vector
@@ -87,6 +88,7 @@ def jgetG_single(u):
     return Gu
 
 # to be used in instanton computation
+@jax.jit
 def jgetChi_single(dW):
     """
     :param dW: (dim,)
@@ -94,11 +96,13 @@ def jgetChi_single(dW):
     """
     return chi_sqrt * dW
 
+@jax.jit
 def jgetF(u):
     return jnp.sum(u) # return total velocity across all shells
 ######################################################################
 # quadrature rule for time integrals
 
+@jax.jit
 def jgetTimeIntegral(a, b):
     ret = jnp.sum(a * b, axis = 1) * dt
     return jnp.sum(ret[:-1])
@@ -106,6 +110,7 @@ def jgetTimeIntegral(a, b):
 ######################################################################
 # JAX implementation of noise to observable map that can be automatically differentiated
 
+@jax.jit
 def integrate_forward_jax(etaa):
     def scan_fun(u, etaaa):
         ret_u = jgetIF_single(u + dt * jgetG_single(u) + dt * jgetChi_single(etaaa), dt) # * jnp.exp(-nu * k**2 * dt)
@@ -117,7 +122,7 @@ def integrate_forward_jax(etaa):
 def integrate_forward_obs_jax(etaa):
     return integrate_forward_jax(etaa)[1]
 
-
+@jax.jit
 def integrate_forward(etaa):
     def scan_fun(u, eta_i):
         u_next = jgetIF_single(u + dt * jgetG_single(u) + dt * jgetChi_single(eta_i), dt)
@@ -319,17 +324,22 @@ if __name__ == '__main__':
         plt.close()
 
         plt.figure()
-        n_seconds = int(T)
         shells = np.arange(dim)
-        for s in range(n_seconds):
-            u_at_t = u_snapshots[:, s]
+        plot_times = [0, 5, 25, 50, 100, 200, 300]
+
+        for s in plot_times:
+            if s == 0:
+                u_at_t = np.array(init_u)
+            else:
+                u_at_t = u_snapshots[:, s - 1]  # u_snapshots is 0-indexed from t=1
             u_sq = np.array(u_at_t ** 2)
-            u_sq = np.where(u_sq > 0, u_sq, np.nan)  # avoid log(0)
-            plt.plot(shells, u_sq, label=f't = {s + 1}', marker='o')
+            u_sq = np.where(u_sq > 0, u_sq, np.nan)
+            plt.plot(shells, u_sq, label=f't = {s}', marker='o')
+
         plt.xlabel(r'shell $n$')
         plt.ylabel(r'$\log(u_n^2)$')
         plt.yscale('log')
-        plt.legend(fontsize=6, ncol=2)
+        plt.legend(fontsize=8, ncol=2)
         plt.savefig(data_dir + '/inst_log_energy_spectrum.pdf', bbox_inches='tight')
         plt.close()
 
